@@ -14,6 +14,20 @@ DeepSeek V4 output format::
     <｜DSML｜parameter name="count" string="false">5</｜DSML｜parameter>
     </｜DSML｜invoke>
     </｜DSML｜tool_calls>
+
+The model is prompted with an opened ``<think>`` (via custom Python prompt
+logic, not the chat template -- see ``vllm/tokenizers/deepseek_v4_encoding.py``),
+so ``thinking=True`` starts the parser in ``REASONING``. The model does not
+always close it: short replies sometimes skip deliberation and answer
+directly, so generation can end with no ``</think>`` ever seen. Without a
+fallback, that entire reply is classified as reasoning and ``content`` stays
+empty (vLLM issue #48645).
+
+When ``force_nonempty_content=True`` (opt-in, mirroring the Nemotron V3
+precedent -- see ``vllm/parser/nemotron_v3.py`` and PR #39091), an
+unterminated reasoning block is surfaced as content instead. See
+``_should_force_content`` and ``get_streaming_fallback_content`` below for
+the exact gating.
 """
 
 from __future__ import annotations
@@ -35,6 +49,12 @@ from vllm.parser.engine.parser_engine_config import (
 from vllm.tool_parsers.utils import find_tool_name, find_tool_properties
 
 if TYPE_CHECKING:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+    from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+    from vllm.parser.engine.events import SemanticEvent
     from vllm.tokenizers import TokenizerLike
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
@@ -285,6 +305,14 @@ class DeepSeekV4Parser(ParserEngine):
         **kwargs,
     ) -> None:
         chat_kwargs = kwargs.pop("chat_template_kwargs", None) or {}
+        # These kwargs already carry --default-chat-template-kwargs (the
+        # serving layer merges them in via ChatParams.with_defaults before
+        # constructing the parser), so remember the opt-in here: the merged
+        # defaults never reach `request.chat_template_kwargs`, which is all
+        # `_should_force_content` can see per-request.
+        self._default_force_content = (
+            chat_kwargs.get("force_nonempty_content") is True
+        )
         thinking = bool(
             chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
         )
@@ -298,6 +326,7 @@ class DeepSeekV4Parser(ParserEngine):
             **kwargs,
         )
         self._arg_converter = self._convert_args
+        self._streamed_reasoning: list[str] = []
         self._recovery_request_tools: list[Tool] = list(tools or [])
         self._recovery_suppressed = False
         self._engine.recovery_tool_name_validator = self._can_recover_tool_name
@@ -321,3 +350,127 @@ class DeepSeekV4Parser(ParserEngine):
             return result
         func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
         return _unwrap_wrapper_args(result, self._tools, func_name)
+
+    # ── #48645: surface unterminated reasoning as content ──────────────
+    #
+    # Mirrors the Nemotron V3 pattern (PR #39091, vllm/parser/nemotron_v3.py)
+    # per bbrowning's guidance on #48645: opt-in via a chat_template_kwargs
+    # flag, buffering already-streamed reasoning chunks (state.previous_text
+    # is unreliable for engine-based streams -- see StreamState.commit)
+    # rather than re-parsing raw text.
+
+    def _reset(self, initial_state: ParserState | None = None) -> None:
+        super()._reset(initial_state=initial_state)
+        self._streamed_reasoning = []
+
+    def _events_to_delta(
+        self,
+        events: list[SemanticEvent],
+        finished: bool = False,
+    ) -> DeltaMessage | None:
+        delta = super()._events_to_delta(events, finished=finished)
+        if delta is not None and delta.reasoning is not None:
+            self._streamed_reasoning.append(delta.reasoning)
+        return delta
+
+    def _should_force_content(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> bool:
+        chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
+        if (
+            chat_template_kwargs
+            and chat_template_kwargs.get("force_nonempty_content") is True
+        ):
+            return True
+        # Fall back to the server default captured at construction: the
+        # merged --default-chat-template-kwargs never lands on the request.
+        return self._default_force_content
+
+    def get_streaming_fallback_content(
+        self,
+        text: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+        finish_reason: str | None = None,
+    ) -> str | None:
+        """Reasoning to promote to content on the terminal streaming delta.
+
+        Called by :meth:`DelegatingParser.finalize_generation` only when
+        the reasoning phase never ended (no ``</think>`` was seen), so a
+        properly closed think block is never touched here -- that buffer
+        is real, deliberate chain-of-thought.
+
+        Gated on, in addition to the caller's own "not ended" check:
+          * opt-in (``force_nonempty_content``);
+          * ``finish_reason == "stop"`` -- a length-truncated (or
+            aborted/errored) generation must never surface a partial,
+            cut-off reasoning trace as a user-facing answer;
+          * no tool call started (structurally redundant here, since
+            ``(REASONING, TOOL_START)`` always emits ``REASONING_END``
+            first -- kept as defense in depth against future transition-
+            table changes).
+        """
+        if not self._should_force_content(request):
+            return None
+        if finish_reason != "stop":
+            return None
+        if self._reasoning_ended or self._tool_slots:
+            return None
+        return "".join(self._streamed_reasoning) or None
+
+    def extract_reasoning(
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> tuple[str | None, str | None]:
+        """Non-streaming counterpart of :meth:`get_streaming_fallback_content`.
+
+        Deliberately narrower than the Nemotron V3 precedent: Nemotron
+        swaps whenever ``content`` ends up empty, even if ``</think>`` was
+        seen (deliberated, then said nothing further). Here the swap only
+        fires when reasoning never terminated -- a closed think block is
+        never touched, matching the streaming gate above. ``finish_reason``
+        is not available at this call site (``extract_reasoning`` is a
+        shared abstract method with no such parameter); see PR description
+        for why that residual gap is accepted here.
+
+        Deliberately re-implements (rather than calls) ``ParserEngine.
+        extract_reasoning``: that method's own ``self._reasoning_ended``
+        is set from the *combined* feed + ``engine.finish()`` events, and
+        ``StreamingParserEngine.finish()`` unconditionally synthesizes a
+        ``REASONING_END`` whenever the engine is still mid-``REASONING``
+        at end-of-input -- exactly the unterminated case this fallback
+        exists for. Checking ``self._reasoning_ended`` after the fact
+        can't tell a real ``</think>`` apart from that synthetic one, so
+        this checks the *fed* events (before ``finish()`` is merged in)
+        for a real ``REASONING_END`` instead.
+        """
+        self._reset()
+        events = self._feed(model_output, [])
+        natural_end = any(e.type == EventType.REASONING_END for e in events)
+        events.extend(self._engine.finish())
+
+        reasoning_parts: list[str] = []
+        content_parts: list[str] = []
+        for event in events:
+            if event.type == EventType.REASONING_CHUNK:
+                reasoning_parts.append(event.value)
+            elif event.type == EventType.TEXT_CHUNK:
+                content_parts.append(event.value)
+            elif event.type == EventType.REASONING_END:
+                self._reasoning_ended = True
+
+        raw_reasoning = "".join(reasoning_parts)
+        if self._strip_trailing_reasoning_ws:
+            raw_reasoning = raw_reasoning.rstrip()
+        reasoning = raw_reasoning or None
+        content = "".join(content_parts) or None
+
+        if (
+            self._should_force_content(request)
+            and not natural_end
+            and not self._tool_slots
+            and (content is None or not content.strip())
+        ):
+            reasoning, content = content, reasoning
+        return reasoning, content
