@@ -2871,7 +2871,27 @@ class Scheduler(SchedulerInterface):
             marked_invalid_block = False
             req_id = request.request_id
             # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            block_ids_by_group = self.kv_cache_manager.get_block_ids(req_id)
+            if len(block_ids_by_group) != 1:
+                # Hybrid KV cache (DeepSeek-V4-Flash has 8 groups): a block id
+                # cannot be mapped to a single token position across groups, so
+                # recompute the whole request instead of truncating at the first
+                # invalid block. Without this the unpacking below raises
+                # ValueError and kills the engine whenever the KV connector
+                # reports a failed load.
+                if any(
+                    block_id in invalid_block_ids
+                    for group_block_ids in block_ids_by_group
+                    for block_id in group_block_ids
+                ):
+                    total_affected_tokens += request.num_computed_tokens
+                    request.num_computed_tokens = 0
+                    if evict_blocks:
+                        for group_block_ids in block_ids_by_group:
+                            blocks_to_evict.update(group_block_ids)
+                    affected_req_ids.add(req_id)
+                continue
+            (req_block_ids,) = block_ids_by_group
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
