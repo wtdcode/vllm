@@ -33,6 +33,7 @@ from vllm.tool_parsers.structural_tag_registry import (
     SUPPORTED_STRUCTURAL_TAG_MODELS,
     VLLM_BUILTIN_STRUCTURAL_TAG_MODELS,
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS,
+    _TRIGGERED_TAG_MODELS,
     get_function_parameters,
     get_model_structural_tag,
 )
@@ -509,7 +510,10 @@ def test_xgrammar_function_parameters_are_preserved(
     assert sample_tools_strict[0].function.parameters is not None
 
 
-@pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))
+@pytest.mark.parametrize(
+    "model",
+    sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS - _TRIGGERED_TAG_MODELS),
+)
 def test_auto_tool_choice_skips_structural_tag_without_strict(
     model: str,
     sample_tools: list[ChatCompletionToolsParam],
@@ -522,6 +526,26 @@ def test_auto_tool_choice_skips_structural_tag_without_strict(
     )
 
     assert tag is None
+
+
+@pytest.mark.parametrize("model", sorted(_TRIGGERED_TAG_MODELS))
+def test_auto_tool_choice_keeps_triggered_tag_without_strict(
+    model: str,
+    sample_tools: list[ChatCompletionToolsParam],
+):
+    """Triggered tags never force a call, so "auto" keeps them.
+
+    Without the tag the model is free to emit malformed DSML the parser
+    cannot recover (runaway invoke names, wrong parameter attributes).
+    """
+    tag = get_model_structural_tag(
+        model=model,
+        tools=sample_tools,
+        tool_choice="auto",
+        reasoning=False,
+    )
+
+    assert tag is not None
 
 
 def test_get_function_parameters_relaxes_function_strict_false():

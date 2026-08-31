@@ -71,6 +71,13 @@ XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset(
     }
 )
 VLLM_BUILTIN_STRUCTURAL_TAG_MODELS = frozenset({"hermes", "kimi_k3"})
+
+# Builtin tags whose tool section is a TriggeredTagsFormat with
+# ``at_least_one=False``: the grammar engages only after the model has already
+# opened the tool-call wrapper on its own, so applying it to a "auto" request
+# never forces a tool call.  For these models the tag is pure envelope
+# correctness and must not be gated on a strict tool.
+_TRIGGERED_TAG_MODELS = frozenset({"deepseek_v4"})
 SUPPORTED_STRUCTURAL_TAG_MODELS = (
     XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS | VLLM_BUILTIN_STRUCTURAL_TAG_MODELS
 )
@@ -110,7 +117,11 @@ def get_model_structural_tag(
     if not tools or tool_choice == "none":
         return None
 
-    if tool_choice == "auto" and not _any_tool_strict(tools):
+    if (
+        tool_choice == "auto"
+        and not _any_tool_strict(tools)
+        and model not in _TRIGGERED_TAG_MODELS
+    ):
         return None
 
     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
