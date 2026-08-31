@@ -52,7 +52,11 @@ DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
 _ESCAPED_DSML = re.escape(_DSML)
 _PARAM_RE = re.compile(
     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
+    # Same boundary as _PARTIAL_PARAM_RE below. The non-greedy form still skips
+    # a mis-spelled closer and latches onto the *next* real one, so one bad
+    # parameter swallows every parameter after it; bounding the value drops the
+    # malformed parameter instead of corrupting its neighbours.
+    rf"((?:(?!</?{_ESCAPED_DSML}).)*)</{_ESCAPED_DSML}parameter>",
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
