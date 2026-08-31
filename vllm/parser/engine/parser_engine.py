@@ -77,6 +77,13 @@ class ToolCallSlot:
 
 
 class ParserEngine(Parser):
+    # xgrammar builtin structural-tag model, when this engine has one.
+    # ParserManager.get_parser returns the shared engine class directly when the
+    # tool and reasoning parsers resolve to the same engine, which bypasses
+    # DelegatingParser._apply_structural_tag entirely -- so the tag has to be
+    # applied here as well or such a model never gets one.
+    structural_tag_model: str | None = None
+
     """A :class:`Parser` backed by a single declarative engine config.
 
     Subclasses set the ``ParserEngineConfig`` in ``__init__`` to define the
@@ -205,6 +212,56 @@ class ParserEngine(Parser):
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request.skip_special_tokens = False
+        return self._apply_structural_tag(request)
+
+    def _apply_structural_tag(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        from openai.types.responses import ToolChoiceFunction
+
+        from vllm import envs
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionNamedToolChoiceParam,
+        )
+        from vllm.entrypoints.openai.engine.protocol import StructuredOutputsParams
+        from vllm.entrypoints.openai.responses.protocol import (
+            ResponsesRequest as _ResponsesRequest,
+        )
+        from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
+
+        if self.structural_tag_model is None or not getattr(request, "tools", None):
+            return request
+        if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING:
+            return request
+
+        tool_choice = getattr(request, "tool_choice", None)
+        named = (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction)
+        if not (tool_choice in ("auto", "required") or isinstance(tool_choice, named)):
+            return request
+
+        tag = get_model_structural_tag(
+            model=self.structural_tag_model,
+            tools=request.tools,
+            tool_choice=tool_choice,
+            # This engine owns reasoning too, so the flag must follow *this
+            # request's* thinking mode.  With reasoning=False xgrammar excludes
+            # </think> from the free-text span, which makes every thinking-mode
+            # response unsamplable; with reasoning=True on a non-thinking
+            # request the grammar waits for a </think> that never comes.
+            reasoning=(
+                self.parser_engine_config.initial_state == ParserState.REASONING
+            ),
+        )
+        if tag is None:
+            return request
+
+        request.structured_outputs = StructuredOutputsParams(
+            structural_tag=json.dumps(tag.model_dump()),
+        )
+        if isinstance(request, _ResponsesRequest):
+            request.text = None
+        else:
+            request.response_format = None
         return request
 
     def _preprocess_feed(

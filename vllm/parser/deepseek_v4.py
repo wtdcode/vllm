@@ -213,6 +213,12 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
 
 
 class DeepSeekV4Parser(ParserEngine):
+    # Applied by ParserEngine.adjust_request. With both --tool-call-parser
+    # and --reasoning-parser set to deepseek_v4, ParserManager collapses to
+    # this shared engine and DeepSeekV4EngineToolParser -- which is where
+    # structural_tag_model used to live -- is never instantiated.
+    structural_tag_model = "deepseek_v4"
+
     def __init__(
         self,
         tokenizer: TokenizerLike,
