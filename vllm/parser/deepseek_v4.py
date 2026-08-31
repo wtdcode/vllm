@@ -57,7 +57,10 @@ _PARAM_RE = re.compile(
 )
 _PARTIAL_PARAM_RE = re.compile(
     rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*)$",
+    # Stop at the next DSML tag boundary instead of swallowing the rest of the
+    # buffer: when the model mis-spells a closer the greedy form absorbs every
+    # following parameter into this one's value.
+    rf"((?:(?!</?{_ESCAPED_DSML}).)*)",
     re.DOTALL,
 )
 
