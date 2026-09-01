@@ -666,6 +666,27 @@ class ParserEngine(Parser):
             return False
         return self._reasoning_ended
 
+    def is_reasoning_end_streaming(
+        self, input_ids: list[int], delta_ids: list[int]
+    ) -> bool:
+        # O(len(delta)). The inherited default rescans the whole sequence,
+        # and the structured-output manager calls this per request per engine
+        # step -- and per speculative position -- while a thinking span is
+        # open. With reasoning spans of tens of thousands of tokens that
+        # full rescan serializes hundreds of milliseconds of Python into
+        # every step and stalls the engine loop.
+        end_id = self._reasoning_end_token_id
+        if end_id is None:
+            return self.is_reasoning_end(input_ids)
+        start_id = self._reasoning_start_token_id
+        ended = None
+        for token_id in delta_ids:
+            if token_id == end_id:
+                ended = True
+            elif start_id is not None and token_id == start_id:
+                ended = False
+        return bool(ended)
+
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         end_id = self._reasoning_end_token_id
         if end_id is not None:
