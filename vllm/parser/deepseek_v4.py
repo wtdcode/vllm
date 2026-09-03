@@ -51,7 +51,7 @@ DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
 
 _ESCAPED_DSML = re.escape(_DSML)
 _PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
     # Same boundary as _PARTIAL_PARAM_RE below. The non-greedy form still skips
     # a mis-spelled closer and latches onto the *next* real one, so one bad
     # parameter swallows every parameter after it; bounding the value drops the
@@ -60,7 +60,7 @@ _PARAM_RE = re.compile(
     re.DOTALL,
 )
 _PARTIAL_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
     # Stop at the next DSML tag boundary instead of swallowing the rest of the
     # buffer: when the model mis-spells a closer the greedy form absorbs every
     # following parameter into this one's value.
