@@ -4,6 +4,8 @@
 
 import json
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from tests.parser.engine.conftest import make_mock_tokenizer
@@ -1005,3 +1007,55 @@ class TestDelegatingParserLargeDelta:
         assert eos_text not in output.reasoning
         assert output.content == ""
         assert output.tool_calls == []
+
+
+# ── Tool-call closer as a sampling stop ───────────────────────────────
+
+
+class TestToolCallStop:
+    """The closing tool_calls tag must end the turn.
+
+    Without it the sampler keeps going after a complete tool-call block and
+    the model opens another one, repeatedly, until it hits max_tokens.
+    """
+
+    def _adapter(self, mock_tokenizer):
+        from vllm.parser.engine.registered_adapters import (
+            DeepSeekV4ParserToolAdapter,
+        )
+
+        return DeepSeekV4ParserToolAdapter(mock_tokenizer)
+
+    def _request(self, stop=None, tools=True):
+        req = MagicMock()
+        req.tools = [{"type": "function"}] if tools else None
+        req.stop = stop
+        req.include_stop_str_in_output = False
+        return req
+
+    def test_exposes_the_block_closer(self, mock_tokenizer):
+        assert self._adapter(mock_tokenizer).tool_call_stop == DSML_TOOL_END
+
+    def test_closer_is_added_and_kept_in_output(self, mock_tokenizer):
+        req = self._adapter(mock_tokenizer)._add_tool_call_stop(self._request([]))
+        assert req.stop == [DSML_TOOL_END]
+        # the parser still has to see the closer to finish the call
+        assert req.include_stop_str_in_output is True
+
+    def test_preserves_caller_supplied_stops(self, mock_tokenizer):
+        ad = self._adapter(mock_tokenizer)
+        assert ad._add_tool_call_stop(self._request(["A"])).stop == ["A", DSML_TOOL_END]
+        assert ad._add_tool_call_stop(self._request("A")).stop == ["A", DSML_TOOL_END]
+
+    def test_idempotent(self, mock_tokenizer):
+        req = self._adapter(mock_tokenizer)._add_tool_call_stop(
+            self._request([DSML_TOOL_END])
+        )
+        assert req.stop == [DSML_TOOL_END]
+
+    def test_untouched_without_tools(self, mock_tokenizer):
+        req = self._adapter(mock_tokenizer)._add_tool_call_stop(
+            self._request([], tools=False)
+        )
+        assert req.stop == []
+        assert req.include_stop_str_in_output is False
