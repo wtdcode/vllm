@@ -1427,3 +1427,150 @@ class TestDelegatingMalformedWrapperRecovery:
         assert output.reasoning == text
         assert output.content == ""
         assert output.tool_calls == []
+
+
+class TestToolNameGuard:
+    """Runaway tool names on the ordinary (wrapped) path.
+
+    When the model quotes an invoke marker inside a valid tool_calls wrapper
+    (e.g. while echoing malformed markup), the name never terminates and used
+    to swallow the rest of the response into ``function_call.name`` (§C-class
+    leak). The name is now held until its terminal and restored as content
+    when it grows past 256 chars or spans lines.
+    """
+
+    def _parser(self, mock_tokenizer, tool):
+        return DeepSeekV4Parser(
+            mock_tokenizer,
+            tools=[tool],
+            chat_template_kwargs={"thinking": False},
+        )
+
+    def test_runaway_name_restored_as_content(self, mock_tokenizer, mock_request):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = self._parser(mock_tokenizer, tool)
+        garbage = (
+            "get_weather {\ncategory: Dexes\n\nWait, that is not a valid "
+            "tool call. Let me just output it.\n"
+        )
+        text = DSML_TOOL_START + "\n" + DSML_INVOKE_PREFIX + garbage + DSML_TOOL_END
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert garbage[:20] in (result.content or "")
+
+    def test_overlong_single_line_name_restored_as_content(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = self._parser(mock_tokenizer, tool)
+        long_name = "x" * 300
+        text = DSML_TOOL_START + DSML_INVOKE_PREFIX + long_name
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is False
+        assert result.tool_calls == []
+        assert long_name[:64] in (result.content or "")
+
+    def test_ordinary_call_still_extracted(self, mock_tokenizer, mock_request):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = self._parser(mock_tokenizer, tool)
+        text = _tool_calls(_recovery_invoke())
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert "Seoul" in result.tool_calls[0].function.arguments
+
+    def test_undeclared_name_still_extracted(self, mock_tokenizer, mock_request):
+        # The guard bounds shape only; it must not start validating names
+        # against the declared tools on the ordinary path.
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = self._parser(mock_tokenizer, tool)
+        text = _tool_calls(_invoke("not_declared", ("city", "true", "Seoul")))
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert result.tools_called is True
+        assert result.tool_calls[0].function.name == "not_declared"
+
+    def test_second_parallel_invoke_runaway_keeps_first_call(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = self._parser(mock_tokenizer, tool)
+        text = (
+            DSML_TOOL_START
+            + _recovery_invoke()
+            + "\n"
+            + DSML_INVOKE_PREFIX
+            + "broken {\nprose continues here"
+        )
+
+        result = parser.extract_tool_calls(text, mock_request)
+
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].function.name == "get_weather"
+        assert "prose continues" in (result.content or "")
+
+    def test_streaming_runaway_name_restored(self, mock_tokenizer, mock_request):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = self._parser(mock_tokenizer, tool)
+        text = (
+            DSML_TOOL_START + "\n" + DSML_INVOKE_PREFIX + "get_weather {\nquoted prose"
+        )
+        chunks = [text[i : i + 7] for i in range(0, len(text), 7)]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        names = [
+            tc.function.name
+            for delta, _ in results
+            if delta
+            for tc in (delta.tool_calls or [])
+            if tc.function and tc.function.name
+        ]
+        assert names == []
+        content = "".join(
+            delta.content for delta, _ in results if delta and delta.content
+        )
+        assert "quoted prose" in content
+
+    def test_streaming_ordinary_call_name_and_args_flow(
+        self, mock_tokenizer, mock_request
+    ):
+        tool = _recovery_tool()
+        mock_request.tools = [tool]
+        parser = self._parser(mock_tokenizer, tool)
+        text = _tool_calls(_recovery_invoke())
+        chunks = [text[i : i + 9] for i in range(0, len(text), 9)]
+
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+
+        names = [
+            tc.function.name
+            for delta, _ in results
+            if delta
+            for tc in (delta.tool_calls or [])
+            if tc.function and tc.function.name
+        ]
+        args = "".join(
+            tc.function.arguments
+            for delta, _ in results
+            if delta
+            for tc in (delta.tool_calls or [])
+            if tc.function and tc.function.arguments
+        )
+        assert names == ["get_weather"]
+        assert "Seoul" in args

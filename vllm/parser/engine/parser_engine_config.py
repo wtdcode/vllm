@@ -50,6 +50,12 @@ class Transition:
     # that leave tool arguments through any other transition are restored as
     # ordinary text.
     commit_provisional_tool_call: bool = False
+    # Buffer the tool name that follows this transition and release the held
+    # events once the name terminal arrives. If the name grows implausibly
+    # long or spans lines -- prose quoting an invoke marker, or a runaway
+    # name -- the held text is restored as content instead of swallowing the
+    # rest of the response into ``function_call.name``.
+    hold_tool_name: bool = False
 
 
 @dataclass(frozen=True)

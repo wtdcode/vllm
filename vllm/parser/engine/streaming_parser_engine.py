@@ -217,6 +217,7 @@ class StreamingParserEngine:
         self._recovery_hold_raw = ""
         self._recovery_hold_token_count = 0
         self._recovery_hold_name = ""
+        self._recovery_hold_name_only = False
         self._recovery_prior_state = self.state
         self._recovery_prior_tool_index = -1
         self._recovery_outer_closer_pending = False
@@ -541,6 +542,13 @@ class StreamingParserEngine:
             if self.recovery_tool_name_validator is None:
                 return self._emit_for_state(value, token_count)
             return self._begin_recovery_hold(transition, value, token_count)
+        if transition.hold_tool_name and not self.skip_tool_parsing:
+            # Bound the tool name on the ordinary (wrapped) path too: prose
+            # that quotes an invoke marker inside a valid wrapper must not
+            # swallow the rest of the response into ``function_call.name``.
+            return self._begin_recovery_hold(
+                transition, value, token_count, name_only=True
+            )
         if (
             self._recovery_outer_closer_pending
             and self.state == ParserState.CONTENT
@@ -554,6 +562,7 @@ class StreamingParserEngine:
         transition: Transition,
         value: str,
         token_count: int,
+        name_only: bool = False,
     ) -> list[SemanticEvent]:
         prior_state = self.state
         prior_tool_index = self.tool_index
@@ -563,6 +572,7 @@ class StreamingParserEngine:
         self._recovery_hold_raw = value
         self._recovery_hold_token_count = token_count
         self._recovery_hold_name = ""
+        self._recovery_hold_name_only = name_only
         self._recovery_prior_state = prior_state
         self._recovery_prior_tool_index = prior_tool_index
         return []
@@ -577,12 +587,20 @@ class StreamingParserEngine:
         self._recovery_hold_token_count += token_count
 
         if self.state == ParserState.TOOL_NAME:
-            validator = self.recovery_tool_name_validator
-            if validator is None or not validator(self._recovery_hold_name):
-                return self._abort_recovery_hold()
+            if not self._recovery_hold_name_only:
+                validator = self.recovery_tool_name_validator
+                if validator is None or not validator(self._recovery_hold_name):
+                    return self._abort_recovery_hold()
             self._recovery_hold_events.extend(
                 self._run_transition(transition, value, token_count)
             )
+            if self._recovery_hold_name_only:
+                # The name completed within bounds; the wrapper itself was
+                # valid, so nothing further needs validation. Release the
+                # held events and stream arguments normally.
+                events = self._recovery_hold_events
+                self._clear_recovery_hold()
+                return events
             return []
 
         if self.state == ParserState.TOOL_ARGS:
@@ -631,7 +649,13 @@ class StreamingParserEngine:
     def _abort_recovery_hold(self) -> list[SemanticEvent]:
         raw = self._recovery_hold_raw
         token_count = self._recovery_hold_token_count
-        self.state = self._recovery_prior_state
+        if self._recovery_hold_name_only:
+            # A held name that never completed is prose quoting an invoke
+            # marker (or a runaway name). Restoring the wrapper state would
+            # silently drop whatever follows, so treat the rest as content.
+            self.state = ParserState.CONTENT
+        else:
+            self.state = self._recovery_prior_state
         self.tool_index = self._recovery_prior_tool_index
         self._reset_args_state()
         self._clear_recovery_hold()
@@ -643,6 +667,7 @@ class StreamingParserEngine:
         self._recovery_hold_raw = ""
         self._recovery_hold_token_count = 0
         self._recovery_hold_name = ""
+        self._recovery_hold_name_only = False
 
     def _run_transition(
         self,
