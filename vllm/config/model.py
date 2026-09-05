@@ -1696,6 +1696,7 @@ class ModelConfig:
             "min_p",
             "max_new_tokens",
             "repetition_detection",
+            "thinking_token_budget",
         ]
         if any(p in config for p in available_params):
             diff_sampling_param = {
