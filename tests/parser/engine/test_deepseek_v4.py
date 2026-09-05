@@ -1969,3 +1969,57 @@ class TestCountReasoningTokens:
         assert streamed > 0
         # passing ids must not disturb a counter that already has a value
         assert parser.count_reasoning_tokens(ids) == streamed
+
+
+class TestOverthinkingCounter:
+    """The counter fires only when reasoning actually reached the budget."""
+
+    def _parser_with_budget(self, budget):
+        from unittest.mock import MagicMock
+
+        from vllm.parser.deepseek_v4 import DeepSeekV4Parser
+
+        tok = MagicMock()
+        tok.get_vocab.return_value = {DSML_THINK_START: 1, DSML_THINK_END: 2}
+        tok.encode.return_value = [1, 2, 3]
+        tok.decode.side_effect = lambda ids: ""
+        tok.all_special_tokens = [DSML_THINK_START, DSML_THINK_END]
+        tok.all_special_ids = [1, 2]
+        model_config = MagicMock()
+        model_config.get_diff_sampling_param.return_value = (
+            {"thinking_token_budget": budget} if budget else {}
+        )
+        parser = DeepSeekV4Parser(
+            tok,
+            tools=[],
+            chat_template_kwargs={"thinking": True},
+            model_config=model_config,
+        )
+        return parser
+
+    def test_budget_read_from_server_defaults(self):
+        assert self._parser_with_budget(30000)._server_thinking_budget == 30000
+        assert self._parser_with_budget(None)._server_thinking_budget is None
+
+    def test_counts_once_when_budget_reached(self):
+        parser = self._parser_with_budget(10)
+        parser._engine._reasoning_token_count = 25
+
+        parser._note_thinking_budget()
+        assert parser._budget_counted is True
+        # a second call in the same parse must not double count
+        parser._budget_counted_before = True
+        parser._note_thinking_budget()
+        assert parser._budget_counted is True
+
+    def test_no_count_below_budget(self):
+        parser = self._parser_with_budget(10000)
+        parser._engine._reasoning_token_count = 25
+        parser._note_thinking_budget()
+        assert parser._budget_counted is False
+
+    def test_no_count_without_server_budget(self):
+        parser = self._parser_with_budget(None)
+        parser._engine._reasoning_token_count = 99999
+        parser._note_thinking_budget()
+        assert parser._budget_counted is False

@@ -43,6 +43,20 @@ if TYPE_CHECKING:
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
 logger = init_logger(__name__)
+try:
+    from prometheus_client import Counter as _PromCounter
+
+    # Reasoning that ran into the server-default thinking budget, i.e. the
+    # model kept deliberating until it was cut off rather than finishing on
+    # its own. Counts turns, not requests: a multi-turn response can hit it
+    # more than once.
+    OVERTHINKING_COUNTER = _PromCounter(
+        "vllm:reasoning_budget_exhausted_total",
+        "Reasoning segments stopped by the server-default thinking budget.",
+        ["model_name"],
+    )
+except Exception:  # prometheus_client absent, or already registered
+    OVERTHINKING_COUNTER = None
 
 
 class ToolCallSlot:
@@ -108,6 +122,17 @@ class ParserEngine(Parser):
                 else "random"
             ),
         )
+        # Server-default thinking budget, for the overthinking counter below.
+        # Per-request overrides are invisible here (the parser never sees
+        # sampling params), so the metric reports against the server default.
+        self._server_thinking_budget: int | None = None
+        if model_config is not None:
+            try:
+                defaults = model_config.get_diff_sampling_param()
+                self._server_thinking_budget = defaults.get("thinking_token_budget")
+            except Exception:
+                self._server_thinking_budget = None
+        self._budget_counted = False
         self._reasoning_parser = None
         self._tool_parser = None
         self.parser_engine_config = parser_engine_config
@@ -193,7 +218,21 @@ class ParserEngine(Parser):
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
         return
 
+    def _note_thinking_budget(self) -> None:
+        """Count this parse if its reasoning ran into the server budget."""
+        if self._budget_counted or OVERTHINKING_COUNTER is None:
+            return
+        budget = self._server_thinking_budget
+        if not budget:
+            return
+        if self._engine.reasoning_token_count >= budget:
+            self._budget_counted = True
+            OVERTHINKING_COUNTER.labels(
+                model_name=self.structural_tag_model or ""
+            ).inc()
+
     def finish_streaming(self) -> DeltaMessage | None:
+        self._note_thinking_budget()
         events = self._engine.finish()
         if events or self._deferred_content or self._deferred_reasoning:
             delta = self._events_to_delta(events, finished=True)
@@ -202,6 +241,7 @@ class ParserEngine(Parser):
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
         self._engine.reset(initial_state=initial_state)
+        self._budget_counted = False
         self._reasoning_ended = not self._has_reasoning
         self._tool_slots.clear()
         self._deferred_content = ""
