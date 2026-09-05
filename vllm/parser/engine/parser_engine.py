@@ -769,8 +769,34 @@ class ParserEngine(Parser):
         return None
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
-        """Return reasoning tokens observed by the parser engine so far."""
-        return self._engine.reasoning_token_count
+        """Return the number of reasoning tokens in *token_ids*.
+
+        The streaming counter is authoritative while it holds a value: it
+        saw the real per-delta token ids. It is not always usable, though --
+        it is zeroed by ``_reset()``, so a non-streaming ``extract_reasoning``
+        after a stream (or instead of one) leaves it at 0, and a stream fed
+        without token ids never accumulates. Callers pass the accumulated
+        output ids exactly so the count can be recovered in those cases;
+        replay them through a throwaway engine rather than returning a
+        counter the caller already knows is empty.
+        """
+        streamed = self._engine.reasoning_token_count
+        if streamed or not token_ids:
+            return streamed
+
+        engine = StreamingParserEngine(
+            self.parser_engine_config,
+            self.model_tokenizer,
+            initial_state=self._engine.config.initial_state,
+        )
+        engine.skip_tool_parsing = True
+        try:
+            text = self.model_tokenizer.decode(list(token_ids))
+        except Exception:
+            return 0
+        engine.feed(text, list(token_ids))
+        engine.finish()
+        return engine.reasoning_token_count
 
     # ── Single-pass parse helper ────────────────────────────────────────
 

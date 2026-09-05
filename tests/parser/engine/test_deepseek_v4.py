@@ -1904,3 +1904,68 @@ class TestForceNonemptyContentStreaming:
         assert eos_text not in output.reasoning
         assert output.content == reasoning_text
         assert eos_text not in output.content
+
+
+class TestCountReasoningTokens:
+    """``count_reasoning_tokens`` must honour the ids it is handed.
+
+    The streaming counter is zeroed by ``_reset()``, so a non-streaming
+    ``extract_reasoning`` leaves it at 0 and the Responses API usage
+    reported ``reasoning_tokens`` far below the reasoning actually
+    returned. Callers pass the accumulated output ids for exactly this
+    case; the count has to be recoverable from them.
+    """
+
+    _THINK = "Let me work through this carefully. " * 8
+
+    def _round_trip_tokenizer(self, text):
+        from unittest.mock import MagicMock
+
+        chunks = [text[i : i + 4] for i in range(0, len(text), 4)]
+        id_to_text = {2000 + i: c for i, c in enumerate(chunks)}
+        id_to_text[1] = DSML_THINK_START
+        id_to_text[2] = DSML_THINK_END
+        t = MagicMock()
+        t.get_vocab.return_value = {DSML_THINK_START: 1, DSML_THINK_END: 2}
+        t.encode.return_value = [1, 2, 3]
+        t.decode.side_effect = lambda ids: "".join(id_to_text.get(i, "") for i in ids)
+        t.all_special_tokens = [DSML_THINK_START, DSML_THINK_END]
+        t.all_special_ids = [1, 2]
+        return t, [2000 + i for i in range(len(chunks))]
+
+    def test_recovered_from_ids_after_non_streaming(self, mock_request):
+        text = self._THINK + DSML_THINK_END + "Answer."
+        tok, ids = self._round_trip_tokenizer(text)
+        parser = DeepSeekV4Parser(
+            tok, tools=[], chat_template_kwargs={"thinking": True}
+        )
+        parser.extract_reasoning(text, mock_request)
+
+        assert parser.count_reasoning_tokens([]) == 0  # nothing to go on
+        recovered = parser.count_reasoning_tokens(ids)
+        # Close to the whole think block, not the near-zero the bug produced.
+        # Exact equality would pin the mock's chunking: the end marker needs
+        # lexer lookahead, so a couple of chunks either side of it land on
+        # whichever side the buffering resolves.
+        expected = len(self._THINK) // 4
+        assert 0.9 * expected <= recovered <= 1.1 * expected
+
+    def test_streaming_counter_wins_over_ids(self, mock_request):
+        text = self._THINK + DSML_THINK_END + "Answer."
+        tok, ids = self._round_trip_tokenizer(text)
+        parser = DeepSeekV4Parser(
+            tok, tools=[], chat_template_kwargs={"thinking": True}
+        )
+        parser.initialize_streaming()
+        prev = ""
+        for i in range(0, len(text), 4):
+            ch = text[i : i + 4]
+            parser.extract_tool_calls_streaming(
+                prev, prev + ch, ch, [], [], [ids[i // 4]], mock_request
+            )
+            prev += ch
+        parser.finish_streaming()
+        streamed = parser.count_reasoning_tokens([])
+        assert streamed > 0
+        # passing ids must not disturb a counter that already has a value
+        assert parser.count_reasoning_tokens(ids) == streamed

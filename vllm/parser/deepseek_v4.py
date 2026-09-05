@@ -310,9 +310,7 @@ class DeepSeekV4Parser(ParserEngine):
         # constructing the parser), so remember the opt-in here: the merged
         # defaults never reach `request.chat_template_kwargs`, which is all
         # `_should_force_content` can see per-request.
-        self._default_force_content = (
-            chat_kwargs.get("force_nonempty_content") is True
-        )
+        self._default_force_content = chat_kwargs.get("force_nonempty_content") is True
         thinking = bool(
             chat_kwargs.get("thinking") or chat_kwargs.get("enable_thinking")
         )
