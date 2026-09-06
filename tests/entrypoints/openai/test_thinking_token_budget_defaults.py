@@ -141,3 +141,40 @@ class TestCompletionThinkingTokenBudget:
         )
 
         assert sampling_params.thinking_token_budget == 0
+
+
+class TestResponsesApiThinkingBudget:
+    """The Responses API needs the same server-default merge.
+
+    Upstream #54469 only touched chat_completion and completion, but the
+    traffic that actually overthinks here is Responses -- unbounded
+    max_output_tokens, reasoning running to the cap. Without this the
+    server default is silently ignored on exactly the path it was set for.
+    """
+
+    DEFAULTS = {"thinking_token_budget": 30000, "top_p": 0.95}
+
+    def _params(self, **kw):
+        from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+        req = ResponsesRequest(input="hi", **kw)
+        return req.to_sampling_params(
+            default_max_tokens=1000, default_sampling_params=self.DEFAULTS
+        )
+
+    def test_server_default_applies_when_request_omits_it(self):
+        assert self._params().thinking_token_budget == 30000
+
+    def test_request_value_wins(self):
+        assert self._params(thinking_token_budget=5000).thinking_token_budget == 5000
+
+    def test_request_zero_wins_over_server_default(self):
+        # 0 means "no reasoning at all" and must not be treated as unset
+        assert self._params(thinking_token_budget=0).thinking_token_budget == 0
+
+    def test_no_server_default_leaves_it_unset(self):
+        from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+        req = ResponsesRequest(input="hi")
+        sp = req.to_sampling_params(default_max_tokens=1000, default_sampling_params={})
+        assert sp.thinking_token_budget is None

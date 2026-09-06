@@ -68,6 +68,7 @@ from vllm.sampling_params import (
     RequestOutputKind,
     SamplingParams,
     StructuredOutputsParams,
+    ThinkingTokenBudget,
 )
 from vllm.utils import random_uuid
 
@@ -161,6 +162,14 @@ class ResponsesRequest(OpenAIBaseModel):
     previous_response_id: str | None = None
     prompt: ResponsePrompt | None = None
     reasoning: Reasoning | None = None
+    thinking_token_budget: ThinkingTokenBudget = Field(
+        default=None,
+        description=(
+            "Maximum number of reasoning tokens before the model is forced to "
+            "close its reasoning block. Overrides the server default set via "
+            "--override-generation-config; 0 disables reasoning entirely."
+        ),
+    )
     include_reasoning: bool = Field(
         default=True,
         description=(
@@ -413,6 +422,9 @@ class ResponsesRequest(OpenAIBaseModel):
                 "top_k", self._DEFAULT_SAMPLING_PARAMS["top_k"]
             )
 
+        if (thinking_token_budget := self.thinking_token_budget) is None:
+            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+
         if (repetition_penalty := self.repetition_penalty) is None:
             repetition_penalty = default_sampling_params.get("repetition_penalty", 1.0)
 
@@ -449,6 +461,7 @@ class ResponsesRequest(OpenAIBaseModel):
             ),
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
+            thinking_token_budget=thinking_token_budget,
             extra_args=extra_args,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             skip_special_tokens=self.skip_special_tokens,
