@@ -156,7 +156,12 @@ class ParserEngineReasoningAdapter(ReasoningParser):
         self._counting_parser_engine._single_pass_parse(
             self.model_tokenizer.decode(token_ids), token_ids
         )
-        return self._counting_parser_engine.count_reasoning_tokens(token_ids)
+        count = self._counting_parser_engine.count_reasoning_tokens(token_ids)
+        # The counting engine is built fresh here and never saw the request,
+        # so it has no thinking budget to measure against. Report the count to
+        # the engine that parsed the request instead.
+        self._parser_engine._note_thinking_budget(count)
+        return count
 
 
 class ParserEngineToolAdapter(ToolParser):
