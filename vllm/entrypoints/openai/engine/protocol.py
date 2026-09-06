@@ -37,6 +37,16 @@ class OpenAIBaseModel(BaseModel):
     # OpenAI API does allow extra fields
     model_config = ConfigDict(extra="allow")
 
+    def named_output_cap(self) -> int | None:
+        """The output-token cap this request named, if it named one.
+
+        Every endpoint spells its cap differently, so each request type
+        overrides this and the shared budget policy in
+        ``resolve_thinking_token_budget`` stays identical across all of them.
+        Returning None means the caller named no cap.
+        """
+        return None
+
     # Cache class field names
     field_names: ClassVar[set[str] | None] = None
 

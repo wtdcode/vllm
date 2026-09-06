@@ -32,6 +32,7 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
     ThinkingTokenBudget,
+    resolve_thinking_token_budget,
 )
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import is_list_of
@@ -340,8 +341,11 @@ class CompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
-        if (thinking_token_budget := self.thinking_token_budget) is None:
-            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+        thinking_token_budget = resolve_thinking_token_budget(
+            self.thinking_token_budget,
+            default_sampling_params.get("thinking_token_budget"),
+            self.named_output_cap(),
+        )
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -405,10 +409,24 @@ class CompletionRequest(OpenAIBaseModel):
             routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 
+    def named_output_cap(self) -> int | None:
+        # max_tokens carries OpenAI's legacy default of 16, so only a request
+        # that actually named a cap counts.
+        if "max_tokens" not in self.model_fields_set:
+            return None
+        return self.max_tokens
+
     @model_validator(mode="before")
     @classmethod
     def normalize_null_max_tokens(cls, data):
-        if isinstance(data, dict) and data.get("max_tokens") is None:
+        # Only an explicit null needs rewriting; an absent key already picks up
+        # the same field default, and filling it in here would mark max_tokens
+        # as set on every request, erasing whether the caller named a cap.
+        if (
+            isinstance(data, dict)
+            and "max_tokens" in data
+            and data["max_tokens"] is None
+        ):
             data = data.copy()
             data["max_tokens"] = cls.model_fields["max_tokens"].default
         return data

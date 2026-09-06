@@ -77,6 +77,41 @@ ThinkingTokenBudget = Annotated[
 ]
 
 
+# A server-default thinking budget is scaled to whatever output cap the request
+# named, so the answer always has room after reasoning closes. A request that
+# names no cap gets the flat server default instead of the model's whole
+# context window, and no request thinks past the ceiling.
+THINKING_BUDGET_OUTPUT_RATIO = 0.75
+THINKING_BUDGET_CEILING = 128_000
+
+
+def resolve_thinking_token_budget(
+    requested: int | None,
+    server_default: int | None,
+    max_output_tokens: int | None,
+) -> int | None:
+    """Pick the thinking budget to enforce for one request.
+
+    Args:
+        requested: Budget the request asked for. Always wins, including 0,
+            which disables reasoning.
+        server_default: Budget from ``--override-generation-config``, applied
+            when the request named no output cap. Falsy leaves reasoning
+            unbounded.
+        max_output_tokens: The request's own output cap, if it named one.
+
+    Returns:
+        The budget to enforce, or None to leave reasoning unbounded.
+    """
+    if requested is not None:
+        return requested
+    if not server_default:
+        return server_default
+    if max_output_tokens is not None:
+        server_default = int(max_output_tokens * THINKING_BUDGET_OUTPUT_RATIO)
+    return min(server_default, THINKING_BUDGET_CEILING)
+
+
 class SamplingType(IntEnum):
     GREEDY = 0
     RANDOM = 1

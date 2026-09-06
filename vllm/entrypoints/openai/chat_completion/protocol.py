@@ -49,6 +49,7 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
     ThinkingTokenBudget,
+    resolve_thinking_token_budget,
 )
 from vllm.utils import random_uuid
 
@@ -519,6 +520,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
     # --8<-- [end:chat-completion-extra-params]
 
+    def named_output_cap(self) -> int | None:
+        return self.max_completion_tokens or self.max_tokens
+
     @model_validator(mode="before")
     @classmethod
     def _normalize_messages_before(cls, data: Any) -> Any:
@@ -685,8 +689,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
-        if (thinking_token_budget := self.thinking_token_budget) is None:
-            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+        thinking_token_budget = resolve_thinking_token_budget(
+            self.thinking_token_budget,
+            default_sampling_params.get("thinking_token_budget"),
+            self.named_output_cap(),
+        )
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones

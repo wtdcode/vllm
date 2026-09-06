@@ -69,6 +69,7 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
     ThinkingTokenBudget,
+    resolve_thinking_token_budget,
 )
 from vllm.utils import random_uuid
 
@@ -422,8 +423,11 @@ class ResponsesRequest(OpenAIBaseModel):
                 "top_k", self._DEFAULT_SAMPLING_PARAMS["top_k"]
             )
 
-        if (thinking_token_budget := self.thinking_token_budget) is None:
-            thinking_token_budget = default_sampling_params.get("thinking_token_budget")
+        thinking_token_budget = resolve_thinking_token_budget(
+            self.thinking_token_budget,
+            default_sampling_params.get("thinking_token_budget"),
+            self.named_output_cap(),
+        )
 
         if (repetition_penalty := self.repetition_penalty) is None:
             repetition_penalty = default_sampling_params.get("repetition_penalty", 1.0)
@@ -476,6 +480,9 @@ class ResponsesRequest(OpenAIBaseModel):
             isinstance(self.include, list)
             and "message.output_text.logprobs" in self.include
         )
+
+    def named_output_cap(self) -> int | None:
+        return self.max_output_tokens
 
     @model_validator(mode="before")
     @classmethod
