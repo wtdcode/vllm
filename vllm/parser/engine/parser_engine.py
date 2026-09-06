@@ -225,7 +225,10 @@ class ParserEngine(Parser):
         budget = self._server_thinking_budget
         if not budget:
             return
-        if self._engine.reasoning_token_count >= budget:
+        # The sampler spends the last token of the budget on the forced
+        # think-end marker, which the parser does not count as reasoning, so a
+        # budget-stopped segment lands one short of ``budget``.
+        if self._engine.reasoning_token_count >= budget - 1:
             self._budget_counted = True
             OVERTHINKING_COUNTER.labels(
                 model_name=self.structural_tag_model or ""
