@@ -248,11 +248,18 @@ class ParserEngine(Parser):
             cap_of() if callable(cap_of) else None,
         )
 
-    def _note_thinking_budget(self) -> None:
-        """Count this parse if its reasoning ran into the budget it ran under."""
+    def _note_thinking_budget(self, reasoning_tokens: int | None = None) -> None:
+        """Count this parse if its reasoning ran into the budget it ran under.
+
+        Callers that already know the true count pass it: the streaming
+        counter reads 0 on the non-streaming paths, which feed the engine
+        without token ids.
+        """
         counter = overthinking_counter()
         if self._budget_counted or counter is None:
             return
+        if reasoning_tokens is None:
+            reasoning_tokens = self._engine.reasoning_token_count
         budget = self._effective_thinking_budget
         if budget is None:
             budget = self._server_thinking_budget
@@ -261,7 +268,7 @@ class ParserEngine(Parser):
         # The sampler spends the last token of the budget on the forced
         # think-end marker, which the parser does not count as reasoning, so a
         # budget-stopped segment lands one short of ``budget``.
-        if self._engine.reasoning_token_count >= budget - 1:
+        if reasoning_tokens >= budget - 1:
             self._budget_counted = True
             counter.labels(model_name=self.structural_tag_model or "").inc()
 
@@ -713,7 +720,6 @@ class ParserEngine(Parser):
             raw_reasoning = raw_reasoning.rstrip()
         reasoning = raw_reasoning or None
         content = "".join(content_parts) or None
-        self._note_thinking_budget()
         return reasoning, content
 
     # ── Non-streaming: extract_reasoning_streaming ────────────────────
@@ -860,6 +866,7 @@ class ParserEngine(Parser):
         """
         streamed = self._engine.reasoning_token_count
         if streamed or not token_ids:
+            self._note_thinking_budget(streamed)
             return streamed
 
         engine = StreamingParserEngine(
@@ -874,6 +881,7 @@ class ParserEngine(Parser):
             return 0
         engine.feed(text, list(token_ids))
         engine.finish()
+        self._note_thinking_budget(engine.reasoning_token_count)
         return engine.reasoning_token_count
 
     # ── Single-pass parse helper ────────────────────────────────────────
