@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import regex as re
 
@@ -44,20 +44,32 @@ if TYPE_CHECKING:
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
 logger = init_logger(__name__)
-try:
-    from prometheus_client import Counter as _PromCounter
+_OVERTHINKING_COUNTER: Any = None
+_OVERTHINKING_COUNTER_UNAVAILABLE = False
 
-    # Reasoning that ran into the server-default thinking budget, i.e. the
-    # model kept deliberating until it was cut off rather than finishing on
-    # its own. Counts turns, not requests: a multi-turn response can hit it
-    # more than once.
-    OVERTHINKING_COUNTER = _PromCounter(
-        "vllm:reasoning_budget_exhausted_total",
-        "Reasoning segments stopped by the server-default thinking budget.",
-        ["model_name"],
-    )
-except Exception:  # prometheus_client absent, or already registered
-    OVERTHINKING_COUNTER = None
+
+def overthinking_counter() -> Any:
+    """Reasoning segments the thinking budget cut off, built on first use.
+
+    Not at import: PrometheusStatLogger sweeps every collector named ``vllm:*``
+    out of the default registry as it sets vLLM's own metrics up, so anything
+    registered while modules are still loading is gone before the server takes
+    its first request.
+    """
+    global _OVERTHINKING_COUNTER, _OVERTHINKING_COUNTER_UNAVAILABLE
+    if _OVERTHINKING_COUNTER is None and not _OVERTHINKING_COUNTER_UNAVAILABLE:
+        try:
+            from prometheus_client import Counter
+
+            _OVERTHINKING_COUNTER = Counter(
+                "vllm:reasoning_budget_exhausted_total",
+                "Reasoning segments stopped by the thinking budget. Counts "
+                "turns, not requests: one response can hit it more than once.",
+                ["model_name"],
+            )
+        except Exception:  # prometheus_client absent, or already registered
+            _OVERTHINKING_COUNTER_UNAVAILABLE = True
+    return _OVERTHINKING_COUNTER
 
 
 class ToolCallSlot:
@@ -238,7 +250,8 @@ class ParserEngine(Parser):
 
     def _note_thinking_budget(self) -> None:
         """Count this parse if its reasoning ran into the budget it ran under."""
-        if self._budget_counted or OVERTHINKING_COUNTER is None:
+        counter = overthinking_counter()
+        if self._budget_counted or counter is None:
             return
         budget = self._effective_thinking_budget
         if budget is None:
@@ -250,9 +263,7 @@ class ParserEngine(Parser):
         # budget-stopped segment lands one short of ``budget``.
         if self._engine.reasoning_token_count >= budget - 1:
             self._budget_counted = True
-            OVERTHINKING_COUNTER.labels(
-                model_name=self.structural_tag_model or ""
-            ).inc()
+            counter.labels(model_name=self.structural_tag_model or "").inc()
 
     def finish_streaming(self) -> DeltaMessage | None:
         self._note_thinking_budget()
