@@ -298,6 +298,7 @@ class ParserEngine(Parser):
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request.skip_special_tokens = False
+        self._note_request_budget(request)
         return self._add_tool_call_stop(self._apply_structural_tag(request))
 
     def _add_tool_call_stop(
@@ -712,6 +713,7 @@ class ParserEngine(Parser):
             raw_reasoning = raw_reasoning.rstrip()
         reasoning = raw_reasoning or None
         content = "".join(content_parts) or None
+        self._note_thinking_budget()
         return reasoning, content
 
     # ── Non-streaming: extract_reasoning_streaming ────────────────────
