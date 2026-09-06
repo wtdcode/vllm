@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import regex as re
 
@@ -27,7 +27,6 @@ from vllm.parser.abstract_parser import Parser, StreamState
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
-from vllm.sampling_params import resolve_thinking_token_budget
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
     extract_types_from_schema,
@@ -44,32 +43,6 @@ if TYPE_CHECKING:
     from vllm.tool_parsers.abstract_tool_parser import Tool
 
 logger = init_logger(__name__)
-_OVERTHINKING_COUNTER: Any = None
-_OVERTHINKING_COUNTER_UNAVAILABLE = False
-
-
-def overthinking_counter() -> Any:
-    """Reasoning segments the thinking budget cut off, built on first use.
-
-    Not at import: PrometheusStatLogger sweeps every collector named ``vllm:*``
-    out of the default registry as it sets vLLM's own metrics up, so anything
-    registered while modules are still loading is gone before the server takes
-    its first request.
-    """
-    global _OVERTHINKING_COUNTER, _OVERTHINKING_COUNTER_UNAVAILABLE
-    if _OVERTHINKING_COUNTER is None and not _OVERTHINKING_COUNTER_UNAVAILABLE:
-        try:
-            from prometheus_client import Counter
-
-            _OVERTHINKING_COUNTER = Counter(
-                "vllm:reasoning_budget_exhausted_total",
-                "Reasoning segments stopped by the thinking budget. Counts "
-                "turns, not requests: one response can hit it more than once.",
-                ["model_name"],
-            )
-        except Exception:  # prometheus_client absent, or already registered
-            _OVERTHINKING_COUNTER_UNAVAILABLE = True
-    return _OVERTHINKING_COUNTER
 
 
 class ToolCallSlot:
@@ -136,17 +109,6 @@ class ParserEngine(Parser):
             ),
         )
         # Server-default thinking budget, for the overthinking counter below.
-        # The configured server default. What a given request actually runs
-        # under is derived from it per request in _note_request_budget().
-        self._server_thinking_budget: int | None = None
-        if model_config is not None:
-            try:
-                defaults = model_config.get_diff_sampling_param()
-                self._server_thinking_budget = defaults.get("thinking_token_budget")
-            except Exception:
-                self._server_thinking_budget = None
-        self._budget_counted = False
-        self._effective_thinking_budget: int | None = None
         self._reasoning_parser = None
         self._tool_parser = None
         self.parser_engine_config = parser_engine_config
@@ -232,48 +194,7 @@ class ParserEngine(Parser):
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
         return
 
-    def _note_request_budget(
-        self, request: ChatCompletionRequest | ResponsesRequest
-    ) -> None:
-        """Remember the budget this request actually runs under.
-
-        The server default is scaled to the request's own output cap, so the
-        flat configured value is not what the sampler enforced and cannot be
-        what the metric checks.
-        """
-        cap_of = getattr(request, "named_output_cap", None)
-        self._effective_thinking_budget = resolve_thinking_token_budget(
-            getattr(request, "thinking_token_budget", None),
-            self._server_thinking_budget,
-            cap_of() if callable(cap_of) else None,
-        )
-
-    def _note_thinking_budget(self, reasoning_tokens: int | None = None) -> None:
-        """Count this parse if its reasoning ran into the budget it ran under.
-
-        Callers that already know the true count pass it: the streaming
-        counter reads 0 on the non-streaming paths, which feed the engine
-        without token ids.
-        """
-        counter = overthinking_counter()
-        if self._budget_counted or counter is None:
-            return
-        if reasoning_tokens is None:
-            reasoning_tokens = self._engine.reasoning_token_count
-        budget = self._effective_thinking_budget
-        if budget is None:
-            budget = self._server_thinking_budget
-        if not budget:
-            return
-        # The sampler spends the last token of the budget on the forced
-        # think-end marker, which the parser does not count as reasoning, so a
-        # budget-stopped segment lands one short of ``budget``.
-        if reasoning_tokens >= budget - 1:
-            self._budget_counted = True
-            counter.labels(model_name=self.structural_tag_model or "").inc()
-
     def finish_streaming(self) -> DeltaMessage | None:
-        self._note_thinking_budget()
         events = self._engine.finish()
         if events or self._deferred_content or self._deferred_reasoning:
             delta = self._events_to_delta(events, finished=True)
@@ -282,7 +203,6 @@ class ParserEngine(Parser):
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
         self._engine.reset(initial_state=initial_state)
-        self._budget_counted = False
         self._reasoning_ended = not self._has_reasoning
         self._tool_slots.clear()
         self._deferred_content = ""
@@ -305,7 +225,6 @@ class ParserEngine(Parser):
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request.skip_special_tokens = False
-        self._note_request_budget(request)
         return self._add_tool_call_stop(self._apply_structural_tag(request))
 
     def _add_tool_call_stop(
@@ -700,7 +619,6 @@ class ParserEngine(Parser):
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
         self._reset()
-        self._note_request_budget(request)
         events = self._feed(model_output, [])
         events.extend(self._engine.finish())
 
@@ -795,7 +713,6 @@ class ParserEngine(Parser):
     ) -> DeltaMessage | None:
         self.initialize_streaming()
         self._check_skip_tool_parsing(request)
-        self._note_request_budget(request)
         events = self._feed(delta_text, delta_token_ids)
         return self._strip_trailing_reasoning(self._events_to_delta(events))
 
@@ -866,7 +783,6 @@ class ParserEngine(Parser):
         """
         streamed = self._engine.reasoning_token_count
         if streamed or not token_ids:
-            self._note_thinking_budget(streamed)
             return streamed
 
         engine = StreamingParserEngine(
@@ -881,7 +797,6 @@ class ParserEngine(Parser):
             return 0
         engine.feed(text, list(token_ids))
         engine.finish()
-        self._note_thinking_budget(engine.reasoning_token_count)
         return engine.reasoning_token_count
 
     # ── Single-pass parse helper ────────────────────────────────────────

@@ -89,6 +89,9 @@ from vllm.entrypoints.openai.responses.utils import (
     extract_function_tool_names,
     extract_tool_types,
 )
+from vllm.entrypoints.openai.thinking_budget_metric import (
+    note_reasoning_length,
+)
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
 from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import VLLMValidationError
@@ -907,6 +910,13 @@ class OpenAIServingResponses(GenerateBaseServing):
             num_reasoning_tokens = context.response_parser.count_reasoning_tokens(
                 accumulated
             )
+
+        note_reasoning_length(
+            self.models.model_config.served_model_name,
+            num_reasoning_tokens,
+            request,
+            self.default_sampling_params,
+        )
 
         usage = ResponseUsage(
             input_tokens=num_prompt_tokens,
