@@ -27,6 +27,7 @@ from vllm.parser.abstract_parser import Parser, StreamState
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+from vllm.sampling_params import resolve_thinking_token_budget
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
     extract_types_from_schema,
@@ -123,8 +124,8 @@ class ParserEngine(Parser):
             ),
         )
         # Server-default thinking budget, for the overthinking counter below.
-        # Per-request overrides are invisible here (the parser never sees
-        # sampling params), so the metric reports against the server default.
+        # The configured server default. What a given request actually runs
+        # under is derived from it per request in _note_request_budget().
         self._server_thinking_budget: int | None = None
         if model_config is not None:
             try:
@@ -133,6 +134,7 @@ class ParserEngine(Parser):
             except Exception:
                 self._server_thinking_budget = None
         self._budget_counted = False
+        self._effective_thinking_budget: int | None = None
         self._reasoning_parser = None
         self._tool_parser = None
         self.parser_engine_config = parser_engine_config
@@ -218,11 +220,29 @@ class ParserEngine(Parser):
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
         return
 
+    def _note_request_budget(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> None:
+        """Remember the budget this request actually runs under.
+
+        The server default is scaled to the request's own output cap, so the
+        flat configured value is not what the sampler enforced and cannot be
+        what the metric checks.
+        """
+        cap_of = getattr(request, "named_output_cap", None)
+        self._effective_thinking_budget = resolve_thinking_token_budget(
+            getattr(request, "thinking_token_budget", None),
+            self._server_thinking_budget,
+            cap_of() if callable(cap_of) else None,
+        )
+
     def _note_thinking_budget(self) -> None:
-        """Count this parse if its reasoning ran into the server budget."""
+        """Count this parse if its reasoning ran into the budget it ran under."""
         if self._budget_counted or OVERTHINKING_COUNTER is None:
             return
-        budget = self._server_thinking_budget
+        budget = self._effective_thinking_budget
+        if budget is None:
+            budget = self._server_thinking_budget
         if not budget:
             return
         # The sampler spends the last token of the budget on the forced
@@ -661,6 +681,7 @@ class ParserEngine(Parser):
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
         self._reset()
+        self._note_request_budget(request)
         events = self._feed(model_output, [])
         events.extend(self._engine.finish())
 
@@ -755,6 +776,7 @@ class ParserEngine(Parser):
     ) -> DeltaMessage | None:
         self.initialize_streaming()
         self._check_skip_tool_parsing(request)
+        self._note_request_budget(request)
         events = self._feed(delta_text, delta_token_ids)
         return self._strip_trailing_reasoning(self._events_to_delta(events))
 
