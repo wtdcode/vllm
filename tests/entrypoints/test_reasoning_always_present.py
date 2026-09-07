@@ -129,3 +129,37 @@ class TestChatCompletionsProtocol:
         norm = src.index('reasoning = ""')
         optout = src.index("if not request.include_reasoning:")
         assert norm < optout, "normalisation must precede the opt-out"
+
+
+def test_every_parse_site_normalises_reasoning():
+    """No parse site may pass the parser's None straight through.
+
+    There are three, and the Responses API has two of them -- one in its
+    context, one in its serving layer. Fixing only the first left
+    /v1/responses still shipping replies with no reasoning item, which the
+    live check caught after the code had already been deployed. Any new call
+    site has to normalise too, so assert on all of them rather than on the
+    ones that happened to be known.
+    """
+    import inspect
+    import re
+
+    from vllm.entrypoints.openai.chat_completion import serving as chat_serving
+    from vllm.entrypoints.openai.responses import context as resp_context
+    from vllm.entrypoints.openai.responses import serving as resp_serving
+
+    for module in (chat_serving, resp_context, resp_serving):
+        src = inspect.getsource(module)
+        sites = [
+            m.start()
+            for m in re.finditer(
+                r"reasoning, content, tool_calls = .*parser\.parse\(", src
+            )
+        ]
+        assert sites, f"{module.__name__}: no parse site found -- did it move?"
+        for pos in sites:
+            window = src[pos : pos + 1200]
+            assert 'reasoning = ""' in window, (
+                f"{module.__name__}: a parse site does not normalise "
+                "reasoning to an empty string"
+            )

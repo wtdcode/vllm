@@ -1090,7 +1090,11 @@ class OpenAIServingResponses(GenerateBaseServing):
                 enable_auto_tools=self.enable_auto_tools,
                 model_output_token_ids=final_output.token_ids,
             )
+            if reasoning is None:
+                # Empty rather than absent; see build_response_output_items.
+                reasoning = ""
             if not request.include_reasoning:
+                # An explicit opt-out still wins: no reasoning item at all.
                 reasoning = None
                 logprobs = None
             return build_response_output_items(
