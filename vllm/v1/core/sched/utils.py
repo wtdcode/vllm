@@ -91,7 +91,30 @@ def remove_all(lst: list, items_to_remove: set) -> list:
     return [item for item in lst if item not in items_to_remove]
 
 
-def check_stop(request: Request, max_model_len: int) -> bool:
+def _is_inside_reasoning(
+    token_ids: Sequence[int],
+    start_token_ids: Sequence[int],
+    end_token_ids: Sequence[int],
+) -> bool:
+    """True when the output has opened a reasoning block and not closed it."""
+    if not start_token_ids or not end_token_ids:
+        return False
+
+    def last_index(needle: Sequence[int]) -> int:
+        n = len(needle)
+        for i in range(len(token_ids) - n, -1, -1):
+            if list(token_ids[i : i + n]) == list(needle):
+                return i
+        return -1
+
+    return last_index(start_token_ids) > last_index(end_token_ids)
+
+
+def check_stop(
+    request: Request,
+    max_model_len: int,
+    reasoning_token_ids: tuple[Sequence[int], Sequence[int]] | None = None,
+) -> bool:
     assert not request.pooling_params
 
     sampling_params = request.sampling_params
@@ -123,6 +146,18 @@ def check_stop(request: Request, max_model_len: int) -> bool:
             repetition_detection,
         )
     ):
+        # A model looping inside its reasoning block has not written a single
+        # token of its answer yet, so ending the request here would hand the
+        # caller a turn holding a thinking block and nothing else. The sampler
+        # closes the block instead (see ThinkingBudgetStateHolder), and the
+        # thinking budget still bounds how long it can go on. Repetition in the
+        # answer has nothing left to close, so it still ends the request.
+        if (
+            reasoning_token_ids is not None
+            and sampling_params.thinking_token_budget is not None
+            and _is_inside_reasoning(request.output_token_ids, *reasoning_token_ids)
+        ):
+            return False
         request.status = RequestStatus.FINISHED_REPETITION
         request.stop_reason = "repetition_detected"
         return True

@@ -67,6 +67,11 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Class-level default: some callers build a Scheduler with
+    # ``object.__new__`` and set only the attributes they touch, so anything
+    # read on the hot path needs a default that does not depend on __init__.
+    _reasoning_token_ids: tuple[list[int], list[int]] | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -79,6 +84,14 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        # Cached for check_stop: repetition inside a reasoning block is closed
+        # by the sampler rather than ending the request.
+        _reasoning = vllm_config.reasoning_config
+        if _reasoning is not None:
+            _start = _reasoning.reasoning_start_token_ids
+            _end = _reasoning.reasoning_end_token_ids
+            if _start and _end:
+                self._reasoning_token_ids = (list(_start), list(_end))
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -2192,7 +2205,7 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
-            stopped = check_stop(request, self.max_model_len)
+            stopped = check_stop(request, self.max_model_len, self._reasoning_token_ids)
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break

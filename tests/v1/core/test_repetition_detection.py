@@ -288,3 +288,69 @@ class TestRepetitionDetectionIntegration:
         )
         request.append_output_token_ids([10, 20, 10, 20, 10, 20])
         assert not check_stop(request, max_model_len=1024)
+
+
+class TestRepetitionInsideReasoning:
+    """Repetition inside a reasoning block must not end the request.
+
+    A model looping inside its thinking has not written a token of its answer
+    yet. Ending the request there hands the caller a turn holding a thinking
+    block and nothing else -- which is what the Anthropic path turned into a
+    successful-but-empty result. The sampler closes the block instead, and the
+    thinking budget still bounds how long the loop can run.
+    """
+
+    START = [900]
+    END = [901]
+    LOOP = [10, 20] * 4
+
+    def _request(self, output, *, budget=1000, detect=True):
+        params = SamplingParams(
+            max_tokens=100000,
+            thinking_token_budget=budget,
+            repetition_detection=RepetitionDetectionParams(
+                max_pattern_size=5, min_pattern_size=2, min_count=3
+            )
+            if detect
+            else None,
+        )
+        request = Request(
+            request_id="test",
+            prompt_token_ids=[1, 2, 3],
+            sampling_params=params,
+            pooling_params=None,
+        )
+        request.append_output_token_ids(output)
+        return request
+
+    def _check(self, request):
+        return check_stop(
+            request, max_model_len=1_000_000, reasoning_token_ids=(self.START, self.END)
+        )
+
+    def test_repetition_inside_reasoning_does_not_stop(self):
+        request = self._request(self.START + self.LOOP)
+        assert not self._check(request)
+        assert request.status != RequestStatus.FINISHED_REPETITION
+
+    def test_repetition_after_reasoning_closed_still_stops(self):
+        request = self._request(self.START + [5, 6] + self.END + self.LOOP)
+        assert self._check(request)
+        assert request.status == RequestStatus.FINISHED_REPETITION
+
+    def test_repetition_without_reasoning_block_still_stops(self):
+        request = self._request(self.LOOP)
+        assert self._check(request)
+        assert request.status == RequestStatus.FINISHED_REPETITION
+
+    def test_no_thinking_budget_means_nothing_will_close_the_block(self):
+        # Without a budget the sampler has no forcing path, so deferring would
+        # let the loop run to max_tokens; keep ending the request.
+        request = self._request(self.START + self.LOOP, budget=None)
+        assert self._check(request)
+        assert request.status == RequestStatus.FINISHED_REPETITION
+
+    def test_unchanged_when_caller_passes_no_reasoning_ids(self):
+        request = self._request(self.START + self.LOOP)
+        assert check_stop(request, max_model_len=1_000_000)
+        assert request.status == RequestStatus.FINISHED_REPETITION

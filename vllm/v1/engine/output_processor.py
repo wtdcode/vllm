@@ -44,6 +44,21 @@ from vllm.v1.outputs import SamplingMaskLists
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
 
 
+# The engine's stop reasons are richer than any of the API schemas: `repetition`
+# has no counterpart in the OpenAI, Responses, or Anthropic enums. Surfacing it
+# raw breaks clients that validate the enum -- the Anthropic layer maps it
+# through a dict and emits `"stop_reason": null`, and the Claude SDK then
+# reports a successful turn carrying no result at all. Report the closest
+# schema value instead; the precise reason survives on ``stop_reason``
+# ("repetition_detected") and on the metrics label, which read the enum.
+_CLIENT_FINISH_REASON_ALIASES = {"repetition": "stop"}
+
+
+def _client_finish_reason(finish_reason: "FinishReason") -> str:
+    name = str(finish_reason)
+    return _CLIENT_FINISH_REASON_ALIASES.get(name, name)
+
+
 class RequestOutputCollector:
     """
     Collects streamed RequestOutputs per individual request,
@@ -427,7 +442,7 @@ class RequestState:
             sampling_mask=sampling_mask,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
-            finish_reason=str(finish_reason) if finished else None,
+            finish_reason=_client_finish_reason(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
         )
 

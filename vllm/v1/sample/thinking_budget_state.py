@@ -8,6 +8,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.core.sched.utils import check_sequence_repetition
 from vllm.v1.sample.logits_processor.interface import (
     BatchUpdate,
     MoveDirectionality,
@@ -95,6 +96,7 @@ class ThinkingBudgetStateHolder:
                 )
                 self._state[index]["output_tok_ids"] = output_tok_ids
                 self._state[index]["spec_token_ids"] = []
+                self._state[index]["repetition_detection"] = params.repetition_detection
             else:
                 self._state.pop(index, None)
 
@@ -145,7 +147,31 @@ class ThinkingBudgetStateHolder:
                 state["spec_token_ids"] = []
             state["in_spec_mode"] = self.in_spec_mode
             state["force_index"] = []
+            if self._reasoning_is_repeating(state):
+                # Spend the rest of the budget so the existing forcing path
+                # closes the reasoning block on the next step. Ending the
+                # request here instead would hand the client a turn holding a
+                # thinking block and no answer at all.
+                state["check_count_down"] = 0
             self._update_think_state(state)
+
+    def _reasoning_is_repeating(self, state: dict[str, Any]) -> bool:
+        """True when this request is looping inside its reasoning block.
+
+        Repetition inside reasoning is worth interrupting but not worth
+        killing: the model has not written a single token of its answer yet,
+        so ending the request leaves the caller with a thinking block and
+        nothing else. Closing the block instead lets it write one.
+        """
+        params = state.get("repetition_detection")
+        if params is None or state.get("in_end", False):
+            return False
+        if state.get("start_thinking", -1) < 0 and not state.get("in_think", False):
+            return False
+        output = state.get("output_tok_ids") or []
+        if not output:
+            return False
+        return check_sequence_repetition(output, params)
 
     def apply_to_logits(
         self,
