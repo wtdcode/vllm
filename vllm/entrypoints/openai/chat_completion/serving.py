@@ -525,6 +525,20 @@ class OpenAIServingChat(GenerateBaseServing):
                             delta=DeltaMessage(
                                 role=role,
                                 content="",
+                                # Empty, not absent, for the same reason the
+                                # non-streaming path fills it in: a client
+                                # assembling this stream and mirroring it back
+                                # must have a reasoning field to send, or
+                                # upstream refuses the whole conversation.
+                                # Later deltas append to it as usual.
+                                reasoning=(
+                                    ""
+                                    if (
+                                        self.parser_cls is not None
+                                        and request.include_reasoning
+                                    )
+                                    else None
+                                ),
                             ),
                             logprobs=None,
                             finish_reason=None,
@@ -953,8 +967,18 @@ class OpenAIServingChat(GenerateBaseServing):
                     enable_auto_tools=self.enable_auto_tools,
                     model_output_token_ids=token_ids,
                 )
+                if reasoning is None:
+                    # Empty, not absent. Upstream refuses a conversation whose
+                    # assistant turn carries no reasoning_content -- "The
+                    # `reasoning_content` in the thinking mode must be passed
+                    # back to the API" -- so a turn where the model chose not
+                    # to reason would poison the rest of that conversation for
+                    # any client that mirrors our replies back. Upstream itself
+                    # accepts (and returns) an empty one.
+                    reasoning = ""
                 suppress_metadata = not request.include_reasoning and parser is not None
                 if not request.include_reasoning:
+                    # An explicit opt-out still wins: no field at all.
                     reasoning = None
                 reasoning_tokens = parser.count_reasoning_tokens(token_ids)
                 total_reasoning_tokens += reasoning_tokens

@@ -59,7 +59,14 @@ def build_response_output_items(
     outputs: list[ResponseOutputItem] = []
     tool_call_name_map = build_responses_tool_call_name_map(tools)
 
-    if reasoning:
+    # Emitted even when empty. Upstream refuses a conversation replaying an
+    # assistant turn that carries no reasoning -- "The `reasoning_content` in
+    # the thinking mode must be passed back to the API" -- and refuses it
+    # whether or not the new request asks for thinking, so one turn without it
+    # poisons the rest of that conversation for any client that mirrors our
+    # replies back. ``reasoning is None`` means the caller opted out of
+    # reasoning entirely; an empty string means the model produced none.
+    if reasoning is not None:
         outputs.append(
             ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
