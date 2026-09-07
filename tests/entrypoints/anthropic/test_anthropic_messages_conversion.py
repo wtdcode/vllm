@@ -1084,8 +1084,11 @@ class TestMessageStreamConverterToolUseContentBuffering:
             for ev_type, data in events
             if ev_type == "content_block_start"
         ]
-        assert block_starts[0] == ("tool_use", 0)
-        assert block_starts[1] == ("text", 1)
+        # Every reply now opens with a thinking block -- empty here, since this
+        # stream carries no reasoning -- so the real blocks start at index 1.
+        assert block_starts[0] == ("thinking", 0)
+        assert block_starts[1] == ("tool_use", 1)
+        assert block_starts[2] == ("text", 2)
 
         msg_deltas = [data for ev_type, data in events if ev_type == "message_delta"]
         assert msg_deltas[0]["delta"]["stop_reason"] == "tool_use"
@@ -1378,7 +1381,12 @@ def _make_full_converter():
 
 class TestMessagesFullConverter:
     def test_empty_completion_emits_one_text_block(self):
-        """An empty completion still yields exactly one (empty) text block."""
+        """An empty completion still yields an (empty) text block.
+
+        It now trails a thinking block, which every reply carries so that
+        upstream will accept a conversation replaying it, but the text block
+        must survive: clients read content past the reasoning.
+        """
         generator = ChatCompletionResponse(
             id="chatcmpl-empty",
             model="test-model",
@@ -1394,9 +1402,9 @@ class TestMessagesFullConverter:
 
         result = _make_full_converter().messages_full_converter(generator)
 
-        assert len(result.content) == 1
-        assert result.content[0].type == "text"
-        assert result.content[0].text == ""
+        assert [b.type for b in result.content] == ["thinking", "text"]
+        assert result.content[0].thinking == ""
+        assert result.content[1].text == ""
 
 
 # ======================================================================
@@ -1553,3 +1561,71 @@ class TestClientErrorResponses:
 
         assert response.status_code == HTTPStatus.BAD_REQUEST
         assert response.json()["error"]["type"] == "BadRequestError"
+
+
+class TestThinkingBlockAlwaysPresent:
+    """Every assistant turn must carry a thinking block, empty if need be.
+
+    The upstream API refuses any request replaying an assistant turn that has
+    none -- "The `content[].thinking` in the thinking mode must be passed back
+    to the API" -- and refuses it even when the new request asks for no
+    thinking, so a single turn without the block poisons the rest of that
+    conversation. Replaying a captured request confirmed upstream returns an
+    empty block in exactly this situation rather than omitting it. Measured on
+    live traffic before this: 179 of 1938 replies (9.2%) had no thinking block.
+    """
+
+    @pytest.mark.asyncio
+    async def test_text_only_reply_still_opens_a_thinking_block(self):
+        async def sse_input():
+            yield _make_stream_chunk(delta=DeltaMessage(role="assistant"))
+            yield _make_stream_chunk(delta=DeltaMessage(content="hello"))
+            yield _make_stream_chunk(finish_reason="stop")
+
+        obj = _make_stream_converter()
+        events = _parse_sse_events(
+            [e async for e in obj.message_stream_converter(sse_input())]
+        )
+        starts = [d["content_block"]["type"] for e, d in events
+                  if e == "content_block_start"]
+        assert starts and starts[0] == "thinking", starts
+        assert "text" in starts
+
+    @pytest.mark.asyncio
+    async def test_tool_only_reply_still_opens_a_thinking_block(self):
+        async def sse_input():
+            yield _make_stream_chunk(delta=DeltaMessage(role="assistant"))
+            yield _make_stream_chunk(
+                delta=DeltaMessage(tool_calls=[_tc(id="c1", name="Read", args="")])
+            )
+            yield _make_stream_chunk(delta=DeltaMessage(tool_calls=[_tc(args="{}")]))
+            yield _make_stream_chunk(finish_reason="tool_calls")
+
+        obj = _make_stream_converter()
+        events = _parse_sse_events(
+            [e async for e in obj.message_stream_converter(sse_input())]
+        )
+        starts = [d["content_block"]["type"] for e, d in events
+                  if e == "content_block_start"]
+        assert starts and starts[0] == "thinking", starts
+        assert "tool_use" in starts
+
+    @pytest.mark.asyncio
+    async def test_real_thinking_is_not_duplicated(self):
+        async def sse_input():
+            yield _make_stream_chunk(delta=DeltaMessage(role="assistant"))
+            yield _make_stream_chunk(delta=DeltaMessage(reasoning="pondering"))
+            yield _make_stream_chunk(delta=DeltaMessage(content="answer"))
+            yield _make_stream_chunk(finish_reason="stop")
+
+        obj = _make_stream_converter()
+        events = _parse_sse_events(
+            [e async for e in obj.message_stream_converter(sse_input())]
+        )
+        starts = [d["content_block"]["type"] for e, d in events
+                  if e == "content_block_start"]
+        assert starts.count("thinking") == 1, starts
+        assert starts[0] == "thinking"
+        deltas = [d["delta"].get("thinking") for e, d in events
+                  if e == "content_block_delta" and d["delta"].get("type") == "thinking_delta"]
+        assert "pondering" in "".join(x for x in deltas if x)

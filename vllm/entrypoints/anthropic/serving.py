@@ -638,14 +638,19 @@ class AnthropicServingMessages(OpenAIServingChat):
             result.stop_reason = "tool_use"
 
         content: list[AnthropicContentBlock] = []
-        if choice.message.reasoning:
-            content.append(
-                AnthropicContentBlock(
-                    type="thinking",
-                    thinking=choice.message.reasoning,
-                    signature=uuid.uuid4().hex,
-                )
+        # Always first, even with nothing in it. The upstream API rejects any
+        # conversation replaying an assistant turn that has no thinking block
+        # ("content[].thinking in the thinking mode must be passed back"), and
+        # it rejects it whether or not the new request asks for thinking -- so
+        # one turn without the block poisons the rest of that conversation.
+        # Upstream emits an empty block in the same situation.
+        content.append(
+            AnthropicContentBlock(
+                type="thinking",
+                thinking=choice.message.reasoning or "",
+                signature=uuid.uuid4().hex,
             )
+        )
         if choice.message.content:
             content.append(
                 AnthropicContentBlock(
@@ -663,10 +668,11 @@ class AnthropicServingMessages(OpenAIServingChat):
             )
             content += [anthropic_tool_call]
 
-        # Anthropic's canonical shape for an empty completion is a single
-        # empty text block, not []. Some strict clients assume content[0]
-        # exists, so emit one here.
-        if not content:
+        # Anthropic's canonical shape for an empty completion is an empty text
+        # block, not []. Some strict clients assume there is something to read
+        # besides the reasoning, so the thinking block added above does not
+        # satisfy this on its own.
+        if not any(b.type in ("text", "tool_use") for b in content):
             content.append(AnthropicContentBlock(type="text", text=""))
 
         result.content = content
@@ -688,6 +694,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                     self.signature_emitted: bool = False
                     self.tool_use_id: str | None = None
                     self.pending_content: list[str] = []
+                    self.saw_thinking: bool = False
 
                 def reset(self) -> None:
                     self.block_type = None
@@ -698,6 +705,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                     self.pending_content.clear()
 
                 def start(self, block: AnthropicContentBlock) -> None:
+                    if block.type == "thinking":
+                        self.saw_thinking = True
                     self.block_type = block.type
                     self.block_index = self.content_block_index
                     if block.type == "thinking":
@@ -760,10 +769,35 @@ class AnthropicServingMessages(OpenAIServingChat):
                 state.start(block)
                 return event
 
-            def stop_and_flush() -> list[str]:
+            def ensure_thinking_first() -> list[str]:
+                """Open and close an empty thinking block if none came.
+
+                A turn that streams straight to text or tool_use leaves the
+                client holding an assistant message with no thinking block, and
+                the upstream API refuses any later request replaying it -- even
+                one that asks for no thinking. Upstream itself sends an empty
+                block here, so send one too rather than let a single turn
+                poison the conversation.
+                """
+                if state.saw_thinking:
+                    return []
+                events = [
+                    start_block(AnthropicContentBlock(type="thinking", thinking=""))
+                ]
+                events.extend(stop_active_block())
+                return events
+
+            def stop_and_flush(ensure_thinking: bool = True) -> list[str]:
                 buffered = list(state.pending_content)
                 state.pending_content.clear()
                 events = stop_active_block()
+                # Every path that opens a text or tool_use block comes through
+                # here first, so this is the one place that can guarantee the
+                # thinking block leads. The reasoning path passes False: it is
+                # about to open a real thinking block, and inserting an empty
+                # one ahead of it would ship two.
+                if ensure_thinking:
+                    events.extend(ensure_thinking_first())
                 if not buffered:
                     return events
                 text = "".join(buffered)
@@ -847,7 +881,7 @@ class AnthropicServingMessages(OpenAIServingChat):
                                 pass
                             else:
                                 if state.block_type != "thinking":
-                                    for event in stop_and_flush():
+                                    for event in stop_and_flush(ensure_thinking=False):
                                         yield event
                                     start_event = start_block(
                                         AnthropicContentBlock(
